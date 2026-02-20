@@ -78,6 +78,19 @@ COL_OPT1_VAL  = "Option1 Value"
 # PARTIE 1 — Parsing du stock physique
 # ══════════════════════════════════════════════════════════════
 
+# Variantes de "one size" à normaliser → "Taille unique"
+_ONE_SIZE_VARIANTS = frozenset({
+    "one size", "one-size", "onesize", "os", "o/s", "taille unique",
+    "unique", "u", "tu", "ns", "no size",
+})
+
+def _normalize_size(size: str) -> str:
+    """Normalise les déclinaisons de taille. 'One Size' → 'Taille unique'."""
+    if size.lower().strip() in _ONE_SIZE_VARIANTS:
+        return "Taille unique"
+    return size
+
+
 def parse_physical_stock(source) -> pd.DataFrame:
     """
     Parse le stock physique depuis un chemin (str/Path) ou des bytes.
@@ -104,7 +117,7 @@ def parse_physical_stock(source) -> pd.DataFrame:
         article    = fields[0].strip()
         code_barre = fields[1].strip()
         nom        = fields[2].strip().strip('"').strip()
-        taille     = fields[3].strip().strip('"').strip()
+        taille     = _normalize_size(fields[3].strip().strip('"').strip())
         qte_raw    = fields[4].strip()
         pa_raw     = fields[7].strip() if len(fields) > 7 else ""   # Prix d'achat
         pv_raw     = fields[9].strip() if len(fields) > 9 else ""   # Prix de vente
