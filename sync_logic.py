@@ -403,6 +403,14 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
     matched_barcodes: set = set()   # codes barres physiques déjà revendiqués
     updated = shopify_df.copy()
 
+    # Garantit que les colonnes coût et taille existent (peuvent être absentes de l'export Shopify)
+    if COL_COST not in updated.columns:
+        updated[COL_COST] = ""
+    if COL_OPT1_VAL not in updated.columns:
+        updated[COL_OPT1_VAL] = ""
+    if COL_OPT1_NAME not in updated.columns:
+        updated[COL_OPT1_NAME] = ""
+
     matched        = 0
     qty_changes    = []
     set_to_zero    = []
@@ -466,7 +474,7 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                             "Nom catalogue physique": phys["Nom_catalogue"],
                         })
 
-        # ── Mise à jour des quantités ─────────────────────────────────────────
+        # ── Mise à jour depuis le stock physique ─────────────────────────────
         if phys is not None:
             old_qty = str(row.get(COL_QTY, "0")).strip()
             new_qty = str(phys["Qte"])
@@ -481,6 +489,24 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                     "Méthode":      match_method,
                 })
             updated.at[idx, COL_QTY] = new_qty
+
+            # Prix de vente → Variant Price
+            pv = phys.get("Prix_vente", 0)
+            if pv:
+                updated.at[idx, COL_PRICE] = str(pv)
+
+            # Prix d'achat → Cost per item
+            pa = phys.get("Prix_achat", 0)
+            if pa:
+                updated.at[idx, COL_COST] = str(pa)
+
+            # Taille normalisée → Option1 Value (et Option1 Name si vide)
+            taille = str(phys.get("Taille", "")).strip()
+            if taille:
+                updated.at[idx, COL_OPT1_VAL] = taille
+                # Si la colonne Option1 Name est vide sur cette ligne, on la remplit
+                if not str(updated.at[idx, COL_OPT1_NAME]).strip():
+                    updated.at[idx, COL_OPT1_NAME] = "Taille"
 
             # Renommage carry over (uniquement la ligne avec le titre)
             norm = phys.get("Norm_name", normalize_name(
