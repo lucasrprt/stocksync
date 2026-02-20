@@ -651,12 +651,20 @@ def run_sync(phys_source, shop_source) -> dict:
         buf2 = io.StringIO()
         new_df.to_csv(buf2, index=False)
         new_products_bytes = buf2.getvalue().encode("utf-8")
+
+        # Fichier combiné : nouveaux produits EN HAUT, puis Shopify mis à jour
+        combined_df = pd.concat([new_df, shopify_updated], ignore_index=True)
+        buf3 = io.StringIO()
+        combined_df.to_csv(buf3, index=False)
+        combined_bytes = buf3.getvalue().encode("utf-8")
     else:
         new_products_bytes = b""
+        combined_bytes = shopify_csv_bytes  # Rien de nouveau → fichier Shopify seul
 
     return {
         "shopify_csv":      shopify_csv_bytes,
         "new_products_csv": new_products_bytes,
+        "combined_csv":     combined_bytes,
         "report":           generate_report(stats),
         "stats":            stats,
     }

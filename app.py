@@ -294,14 +294,19 @@ HTML = """<!DOCTYPE html>
   <h2>Résultats</h2>
   <div class="stats-grid" id="statsGrid"></div>
 
-  <a class="dl-btn" id="dlShopify" href="#" download="stock_shopify_updated.csv">
-    📥 Télécharger le stock Shopify mis à jour
-    <span class="badge" id="dlShopifyBadge">CSV</span>
+  <a class="dl-btn" id="dlCombined" href="#" download="stock_complet.csv">
+    ⭐ Télécharger le fichier complet (nouveaux + existants)
+    <span class="badge">CSV</span>
+  </a>
+
+  <a class="dl-btn" id="dlShopify" href="#" download="stock_shopify_updated.csv" style="margin-top:8px">
+    📥 Shopify mis à jour uniquement
+    <span class="badge">CSV</span>
   </a>
 
   <a class="dl-btn" id="dlNew" href="#" download="nouveaux_produits.csv" style="display:none">
-    ➕ Télécharger les nouveaux produits
-    <span class="badge" id="dlNewBadge">CSV</span>
+    ➕ Nouveaux produits uniquement
+    <span class="badge">CSV</span>
   </a>
 
   <h2 style="margin-top:24px; margin-bottom:12px;">Rapport</h2>
@@ -368,11 +373,13 @@ HTML = """<!DOCTYPE html>
         { v: s.not_in_shopify.length,             n: 'Nouveaux'       },
       ].map(x => `<div class="stat"><div class="value">${x.v}</div><div class="name">${x.n}</div></div>`).join('');
 
-      // Download Shopify CSV
-      const dlS = document.getElementById('dlShopify');
-      dlS.href = 'data:text/csv;base64,' + data.shopify_csv_b64;
+      // Fichier complet (nouveaux en haut + Shopify mis à jour)
+      document.getElementById('dlCombined').href = 'data:text/csv;base64,' + data.combined_csv_b64;
 
-      // Download new products CSV
+      // Shopify mis à jour seul
+      document.getElementById('dlShopify').href = 'data:text/csv;base64,' + data.shopify_csv_b64;
+
+      // Nouveaux produits seuls
       const dlN = document.getElementById('dlNew');
       if (data.has_new_products) {
         dlN.href = 'data:text/csv;base64,' + data.new_products_csv_b64;
@@ -419,8 +426,9 @@ async def sync(
 
         result = run_sync(phys_bytes, shop_bytes)
 
-        shopify_b64  = base64.b64encode(result["shopify_csv"]).decode()
-        new_prod_b64 = base64.b64encode(result["new_products_csv"]).decode() if result["new_products_csv"] else ""
+        shopify_b64   = base64.b64encode(result["shopify_csv"]).decode()
+        new_prod_b64  = base64.b64encode(result["new_products_csv"]).decode() if result["new_products_csv"] else ""
+        combined_b64  = base64.b64encode(result["combined_csv"]).decode()
 
         # Convertir les stats pour la sérialisation JSON
         stats = {k: (v if not isinstance(v, list) else v)
@@ -429,6 +437,7 @@ async def sync(
         return JSONResponse({
             "shopify_csv_b64":      shopify_b64,
             "new_products_csv_b64": new_prod_b64,
+            "combined_csv_b64":     combined_b64,
             "has_new_products":     bool(result["new_products_csv"]),
             "report":               result["report"],
             "stats":                stats,
