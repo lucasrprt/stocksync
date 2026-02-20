@@ -91,6 +91,19 @@ def _normalize_size(size: str) -> str:
     return size
 
 
+def _norm_size_for_match(size: str) -> str:
+    """
+    Normalise une taille pour la comparaison lors du matching multi-stratégie.
+    'M' → 'm', 'Taille unique' / 'One Size' / 'TU' → 'taille unique', '' → ''
+    """
+    s = size.lower().strip()
+    if not s or s in ("default title", "default"):
+        return ""
+    if s in _ONE_SIZE_VARIANTS or s == "taille unique":
+        return "taille unique"
+    return s
+
+
 def parse_physical_stock(source) -> pd.DataFrame:
     """
     Parse le stock physique depuis un chemin (str/Path) ou des bytes.
@@ -355,30 +368,106 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
     """
     Synchronise les quantités du stock physique dans le CSV Shopify.
 
-    Règles :
-      - Match par Variant Barcode (= Code_barre physique)
-      - Quantité physique → Variant Inventory Qty Shopify
-      - Absent du physique → quantité mise à 0 + signalé dans le rapport
-      - Carry over → suffixe S1/S2 ajouté au Title (première ligne du produit uniquement)
-    """
-    phys_index = {row["Code_barre"]: row for _, row in physical_df.iterrows()}
-    updated    = shopify_df.copy()
+    Stratégies de matching (par ordre de priorité) :
+      1. Variant Barcode = Code_barre physique        (exact, le plus fiable)
+      2. Variant SKU + Taille = SKU extrait du Nom_catalogue + Taille physique
+      3. Titre normalisé Shopify ≈ Nom_catalogue normalisé physique + même Taille
 
-    matched        = []
+    Les matches par SKU ou titre sont signalés dans le rapport pour vérification
+    manuelle — permet de corriger les codes barres Shopify si nécessaire.
+    """
+    # ── Pré-indexation du stock physique ─────────────────────────────────────
+    phys_by_barcode: dict = {}
+    phys_by_sku:     dict = {}   # (sku_upper, norm_size) → row
+    phys_by_title:   dict = {}   # (norm_title, norm_size) → row
+
+    for _, row in physical_df.iterrows():
+        bc = row["Code_barre"]
+        if bc:
+            phys_by_barcode[bc] = row
+
+        clean, sku = extract_sku_and_title(row["Nom_catalogue"])
+        norm_t  = normalize_name(clean)
+        norm_sz = _norm_size_for_match(row["Taille"])
+
+        if sku:
+            key = (sku.upper(), norm_sz)
+            if key not in phys_by_sku:      # premier trouvé gagne
+                phys_by_sku[key] = row
+
+        if norm_t:
+            key = (norm_t, norm_sz)
+            if key not in phys_by_title:    # premier trouvé gagne
+                phys_by_title[key] = row
+
+    matched_barcodes: set = set()   # codes barres physiques déjà revendiqués
+    updated = shopify_df.copy()
+
+    matched        = 0
     qty_changes    = []
     set_to_zero    = []
     carry_over_upd = []
+    sku_matches    = []    # matchés via SKU (à vérifier par l'utilisateur)
+    title_matches  = []   # matchés via titre (à vérifier par l'utilisateur)
 
     for idx, row in updated.iterrows():
         barcode = str(row.get(COL_BARCODE, "")).strip()
         if not barcode:
             continue
 
-        if barcode in phys_index:
-            phys = phys_index[barcode]
-            matched.append(barcode)
+        phys         = None
+        match_method = None
 
-            # Mise à jour des quantités
+        # ── Stratégie 1 : Code barre ─────────────────────────────────────────
+        if barcode in phys_by_barcode:
+            phys         = phys_by_barcode[barcode]
+            match_method = "barcode"
+            matched_barcodes.add(barcode)
+            matched += 1
+
+        # ── Stratégie 2 : Variant SKU + Taille ──────────────────────────────
+        if phys is None:
+            shopify_sku = str(row.get(COL_SKU, "")).strip().upper()
+            norm_sz     = _norm_size_for_match(str(row.get(COL_OPT1_VAL, "")).strip())
+            if shopify_sku:
+                key = (shopify_sku, norm_sz)
+                if key in phys_by_sku:
+                    candidate = phys_by_sku[key]
+                    if candidate["Code_barre"] not in matched_barcodes:
+                        phys         = candidate
+                        match_method = "sku"
+                        matched_barcodes.add(phys["Code_barre"])
+                        matched += 1
+                        sku_matches.append({
+                            "Code barre Shopify":     barcode,
+                            "Code barre physique":    phys["Code_barre"],
+                            "SKU":                    shopify_sku,
+                            "Titre Shopify":          _get_title(updated, idx),
+                            "Nom catalogue physique": phys["Nom_catalogue"],
+                        })
+
+        # ── Stratégie 3 : Titre normalisé + Taille ──────────────────────────
+        if phys is None:
+            shopify_title = normalize_name(str(row.get(COL_TITLE, "")).strip())
+            norm_sz       = _norm_size_for_match(str(row.get(COL_OPT1_VAL, "")).strip())
+            if shopify_title:
+                key = (shopify_title, norm_sz)
+                if key in phys_by_title:
+                    candidate = phys_by_title[key]
+                    if candidate["Code_barre"] not in matched_barcodes:
+                        phys         = candidate
+                        match_method = "titre"
+                        matched_barcodes.add(phys["Code_barre"])
+                        matched += 1
+                        title_matches.append({
+                            "Code barre Shopify":     barcode,
+                            "Code barre physique":    phys["Code_barre"],
+                            "Titre Shopify":          _get_title(updated, idx),
+                            "Nom catalogue physique": phys["Nom_catalogue"],
+                        })
+
+        # ── Mise à jour des quantités ─────────────────────────────────────────
+        if phys is not None:
             old_qty = str(row.get(COL_QTY, "0")).strip()
             new_qty = str(phys["Qte"])
 
@@ -389,12 +478,15 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                     "Taille":       str(row.get(COL_OPT1_VAL, "")).strip(),
                     "Ancienne Qte": old_qty,
                     "Nouvelle Qte": new_qty,
+                    "Méthode":      match_method,
                 })
             updated.at[idx, COL_QTY] = new_qty
 
             # Renommage carry over (uniquement la ligne avec le titre)
-            norm = phys.get("Norm_name", normalize_name(phys["Name_no_sku"] if "Name_no_sku" in phys else phys["Nom_catalogue"]))
-            pid  = phys.get("Product_ID", get_product_id(barcode))
+            norm = phys.get("Norm_name", normalize_name(
+                phys["Name_no_sku"] if "Name_no_sku" in phys.index else phys["Nom_catalogue"]
+            ))
+            pid  = phys.get("Product_ID", get_product_id(phys["Code_barre"]))
             key  = (norm, pid)
 
             if key in carry_over_map:
@@ -410,7 +502,7 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                     })
 
         else:
-            # Absent du physique → quantité = 0
+            # Aucun match trouvé → quantité = 0
             old_qty = str(row.get(COL_QTY, "0")).strip()
             if old_qty not in ("0", ""):
                 updated.at[idx, COL_QTY] = "0"
@@ -421,12 +513,11 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                     "Ancienne Qte": old_qty,
                 })
 
-    # Produits physiques absents de Shopify
-    shopify_bc  = set(shopify_df[COL_BARCODE].str.strip().unique())
+    # Produits physiques non matchés par aucune stratégie → nouveaux produits
     not_in_shop = []
     for _, row in physical_df.iterrows():
         bc = row["Code_barre"]
-        if bc and bc not in shopify_bc:
+        if bc and bc not in matched_barcodes:
             not_in_shop.append({
                 "Code barre":  bc,
                 "Nom":         row["Nom_catalogue"],
@@ -439,11 +530,13 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
     stats = {
         "total_physical":     len(physical_df),
         "total_shopify":      len(shopify_df),
-        "matched":            len(matched),
+        "matched":            matched,
         "qty_changes":        qty_changes,
         "set_to_zero":        set_to_zero,
         "not_in_shopify":     not_in_shop,
         "carry_over_updates": carry_over_upd,
+        "sku_matches":        sku_matches,
+        "title_matches":      title_matches,
     }
     return updated, stats
 
@@ -616,7 +709,10 @@ def generate_report(stats: dict) -> str:
         f"  Stock physique analysé   : {stats['total_physical']} articles",
         f"  Stock Shopify analysé    : {stats['total_shopify']} lignes",
         "",
-        f"  ✅ Codes barres matchés       : {stats['matched']}",
+        f"  ✅ Articles matchés (total)    : {stats['matched']}",
+        f"     • par code barre           : {stats['matched'] - len(stats.get('sku_matches', [])) - len(stats.get('title_matches', []))}",
+        f"     • par SKU                  : {len(stats.get('sku_matches', []))}",
+        f"     • par titre normalisé      : {len(stats.get('title_matches', []))}",
         f"  🔄 Quantités mises à jour     : {len(stats['qty_changes'])}",
         f"  ⬇️  Mis à 0 (absent physique)  : {len(stats['set_to_zero'])}",
         f"  ➕ Nouveaux produits          : {len(stats['not_in_shopify'])}",
@@ -659,6 +755,38 @@ def generate_report(stats: dict) -> str:
     else:
         L += [S2, "CARRY OVER", S2,
               "  Aucun carry over détecté dans ce fichier.", ""]
+
+    if stats.get("sku_matches"):
+        n = len(stats["sku_matches"])
+        L += [S2,
+              f"⚠️  MATCHÉS PAR SKU ({n} variante{'s' if n > 1 else ''}) — CODES BARRES À VÉRIFIER",
+              "   Ces produits ont été matchés via leur référence SKU (pas par code barre).",
+              "   → Corriger les codes barres dans Shopify si nécessaire.",
+              S2]
+        for c in stats["sku_matches"]:
+            L += [
+                f"  SKU : {c['SKU']}",
+                f"    Titre          : {str(c['Titre Shopify'])[:55]}",
+                f"    CB Shopify     : {c['Code barre Shopify']}",
+                f"    CB Physique    : {c['Code barre physique']}",
+                "",
+            ]
+
+    if stats.get("title_matches"):
+        n = len(stats["title_matches"])
+        L += [S2,
+              f"⚠️  MATCHÉS PAR TITRE ({n} variante{'s' if n > 1 else ''}) — À VÉRIFIER ATTENTIVEMENT",
+              "   Ces produits ont été matchés via leur titre normalisé (ni code barre ni SKU).",
+              "   → Vérifier que le match est correct (faux positifs possibles si titres similaires).",
+              S2]
+        for c in stats["title_matches"]:
+            L += [
+                f"  Titre Shopify   : {str(c['Titre Shopify'])[:55]}",
+                f"  Nom physique    : {str(c['Nom catalogue physique'])[:55]}",
+                f"  CB Shopify      : {c['Code barre Shopify']}",
+                f"  CB Physique     : {c['Code barre physique']}",
+                "",
+            ]
 
     L += [S, "  FIN DU RAPPORT", S]
     return "\n".join(L)
