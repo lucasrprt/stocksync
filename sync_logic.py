@@ -59,12 +59,12 @@ KNOWN_BRANDS: dict = dict(
 
 # ── Colonnes Shopify ─────────────────────────────────────────
 COL_TITLE     = "Title"
-
 COL_VENDOR    = "Vendor"
 COL_BARCODE   = "Variant Barcode"
-COL_QTY       = "Variant Inventory Qty"
+COL_QTY       = "Variant Quantity"
 COL_SKU       = "Variant SKU"
 COL_PRICE     = "Variant Price"
+COL_COST      = "Cost per item"
 COL_STATUS    = "Status"
 COL_PUBLISHED = "Published"
 COL_INV_TRACK = "Variant Inventory Tracker"
@@ -106,7 +106,8 @@ def parse_physical_stock(source) -> pd.DataFrame:
         nom        = fields[2].strip().strip('"').strip()
         taille     = fields[3].strip().strip('"').strip()
         qte_raw    = fields[4].strip()
-        pv_raw     = fields[9].strip()
+        pa_raw     = fields[7].strip() if len(fields) > 7 else ""   # Prix d'achat
+        pv_raw     = fields[9].strip() if len(fields) > 9 else ""   # Prix de vente
 
         if not code_barre or code_barre.upper() == "TOTAL" or not article or not nom:
             continue
@@ -119,6 +120,11 @@ def parse_physical_stock(source) -> pd.DataFrame:
             qte = 0
 
         try:
+            prix_achat = float(pa_raw.replace(",", "."))
+        except (ValueError, TypeError):
+            prix_achat = 0.0
+
+        try:
             prix_vente = float(pv_raw.replace(",", "."))
         except (ValueError, TypeError):
             prix_vente = 0.0
@@ -129,6 +135,7 @@ def parse_physical_stock(source) -> pd.DataFrame:
             "Nom_catalogue": nom,
             "Taille":        taille,
             "Qte":           qte,
+            "Prix_achat":    prix_achat,
             "Prix_vente":    prix_vente,
         })
 
@@ -257,10 +264,23 @@ def extract_vendor_and_name(title_upper: str, vendor_map: dict) -> tuple:
 # ══════════════════════════════════════════════════════════════
 
 def parse_shopify(source) -> pd.DataFrame:
-    """Parse l'export CSV Shopify (séparateur virgule, format standard)."""
+    """
+    Parse l'export CSV Shopify (séparateur virgule, format standard).
+
+    Normalise automatiquement le nom de la colonne quantité :
+      "Variant Inventory Qty" → "Variant Quantity"
+    pour garantir la compatibilité entre différentes versions d'export Shopify.
+    """
     if isinstance(source, (str, Path)):
-        return pd.read_csv(source, dtype=str, keep_default_na=False)
-    return pd.read_csv(io.BytesIO(source), dtype=str, keep_default_na=False)
+        df = pd.read_csv(source, dtype=str, keep_default_na=False)
+    else:
+        df = pd.read_csv(io.BytesIO(source), dtype=str, keep_default_na=False)
+
+    # Normalisation de la colonne quantité (compatibilité ancienne/nouvelle version Shopify)
+    if "Variant Inventory Qty" in df.columns and COL_QTY not in df.columns:
+        df = df.rename(columns={"Variant Inventory Qty": COL_QTY})
+
+    return df
 
 
 # ══════════════════════════════════════════════════════════════
@@ -393,11 +413,12 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
         bc = row["Code_barre"]
         if bc and bc not in shopify_bc:
             not_in_shop.append({
-                "Code barre": bc,
-                "Nom":        row["Nom_catalogue"],
-                "Taille":     row["Taille"],
-                "Qte":        row["Qte"],
-                "Prix vente": row["Prix_vente"],
+                "Code barre":  bc,
+                "Nom":         row["Nom_catalogue"],
+                "Taille":      row["Taille"],
+                "Qte":         row["Qte"],
+                "Prix_achat":  row.get("Prix_achat", 0.0),
+                "Prix vente":  row["Prix_vente"],
             })
 
     stats = {
@@ -468,13 +489,15 @@ def generate_new_products(not_in_shopify: list, shopify_df: pd.DataFrame) -> pd.
     for item in not_in_shopify:
         clean_name, sku = extract_sku_and_title(item["Nom"])
         vendor, product_title = extract_vendor_and_name(clean_name, vendor_list)
+        # Title complet = Marque + Nom produit (ex: "Carhartt WIP Cotton Trunks White")
+        full_title = f"{vendor} {product_title}".strip()
         parsed.append({
             **item,
             "_clean_name":     clean_name,
             "_sku":            sku or "",
             "_vendor":         vendor,
-            "_product_title":  product_title,
-            "_handle":         generate_handle(product_title),
+            "_product_title":  full_title,
+            "_handle":         generate_handle(full_title),
         })
 
     # ── Étape 2 : Grouper par produit (handle + SKU) ─────────
@@ -483,6 +506,10 @@ def generate_new_products(not_in_shopify: list, shopify_df: pd.DataFrame) -> pd.
     for item in parsed:
         key = (item["_handle"], item["_sku"])
         by_product[key].append(item)
+
+    # Ajouter "Cost per item" aux colonnes si absent du template Shopify
+    if COL_COST not in columns:
+        columns = columns + [COL_COST]
 
     # ── Étape 3 : Construire les lignes Shopify ──────────────
     rows = []
@@ -494,12 +521,11 @@ def generate_new_products(not_in_shopify: list, shopify_df: pd.DataFrame) -> pd.
 
             # Champs produit (tous remplis sur la 1ère ligne, vides ensuite)
             if i == 0:
-                row[COL_TITLE]     = ref["_product_title"]
+                row[COL_TITLE]     = ref["_product_title"]   # Marque + Nom produit
                 row[COL_VENDOR]    = ref["_vendor"]
                 row[COL_STATUS]    = "draft"
                 row[COL_PUBLISHED] = "FALSE"
                 row[COL_OPT1_NAME] = "Taille"
-
             else:
                 # Les lignes suivantes répètent le titre (format Shopify standard)
                 row[COL_TITLE] = ref["_product_title"]
@@ -508,8 +534,9 @@ def generate_new_products(not_in_shopify: list, shopify_df: pd.DataFrame) -> pd.
             row[COL_OPT1_VAL]  = variant["Taille"]
             row[COL_SKU]       = variant["_sku"]
             row[COL_BARCODE]   = variant["Code barre"]
-            row[COL_QTY]       = str(variant["Qte"])
-            row[COL_PRICE]     = str(variant["Prix vente"])
+            row[COL_QTY]       = str(variant["Qte"])               # Variant Quantity
+            row[COL_COST]      = str(variant.get("Prix_achat", "")) # Cost per item
+            row[COL_PRICE]     = str(variant["Prix vente"])         # Variant Price
             row[COL_INV_TRACK] = "shopify"
             row[COL_INV_POL]   = "deny"
             row[COL_FULFILL]   = "manual"
