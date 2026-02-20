@@ -386,6 +386,7 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                 qty_changes.append({
                     "Code barre":   barcode,
                     "Titre":        _get_title(updated, idx),
+                    "Taille":       str(row.get(COL_OPT1_VAL, "")).strip(),
                     "Ancienne Qte": old_qty,
                     "Nouvelle Qte": new_qty,
                 })
@@ -416,6 +417,7 @@ def sync_stocks(physical_df: pd.DataFrame, shopify_df: pd.DataFrame, carry_over_
                 set_to_zero.append({
                     "Code barre":   barcode,
                     "Titre":        _get_title(updated, idx),
+                    "Taille":       str(row.get(COL_OPT1_VAL, "")).strip(),
                     "Ancienne Qte": old_qty,
                 })
 
@@ -663,6 +665,56 @@ def generate_report(stats: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
+# PARTIE 9 — CSV Rapport
+# ══════════════════════════════════════════════════════════════
+
+def generate_rapport_csv(stats: dict) -> bytes:
+    """
+    Génère un CSV synthétique listant toutes les modifications de quantité :
+      - Mises à jour (physique → Shopify)
+      - Remises à zéro (absent du physique)
+
+    Colonnes : Titre | Taille | Qté Shopify (avant) | Qté Physique (après)
+    """
+    rows = []
+
+    for c in stats.get("qty_changes", []):
+        rows.append({
+            "Titre":              c["Titre"],
+            "Taille":             c.get("Taille", ""),
+            "Qté Shopify (avant)": c["Ancienne Qte"],
+            "Qté Physique (après)": c["Nouvelle Qte"],
+            "Statut":             "Mis à jour",
+        })
+
+    for c in stats.get("set_to_zero", []):
+        rows.append({
+            "Titre":              c["Titre"],
+            "Taille":             c.get("Taille", ""),
+            "Qté Shopify (avant)": c["Ancienne Qte"],
+            "Qté Physique (après)": "0",
+            "Statut":             "Remis à zéro (absent du physique)",
+        })
+
+    if not rows:
+        rows.append({
+            "Titre":               "— Aucun changement de quantité détecté —",
+            "Taille":              "",
+            "Qté Shopify (avant)": "",
+            "Qté Physique (après)": "",
+            "Statut":              "",
+        })
+
+    df = pd.DataFrame(rows, columns=[
+        "Titre", "Taille", "Qté Shopify (avant)", "Qté Physique (après)", "Statut"
+    ])
+
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════
 # POINT D'ENTRÉE
 # ══════════════════════════════════════════════════════════════
 
@@ -714,6 +766,7 @@ def run_sync(phys_source, shop_source) -> dict:
         "new_products_csv": new_products_bytes,
         "combined_csv":     combined_bytes,
         "filtered_csv":     filtered_bytes,
+        "rapport_csv":      generate_rapport_csv(stats),
         "report":           generate_report(stats),
         "stats":            stats,
     }
