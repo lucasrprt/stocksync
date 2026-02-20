@@ -560,7 +560,48 @@ def generate_new_products(not_in_shopify: list, shopify_df: pd.DataFrame) -> pd.
 
 
 # ══════════════════════════════════════════════════════════════
-# PARTIE 7 — Rapport
+# PARTIE 7 — Filtrage stock zéro
+# ══════════════════════════════════════════════════════════════
+
+def filter_zero_stock_products(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Retire les produits dont TOUTES les variantes ont une quantité à 0.
+
+    Règle : si au moins une variante d'un produit a qty > 0, tout le produit
+    est conservé. Un produit n'est retiré que si 100% de ses variantes sont à 0.
+
+    Le regroupement se fait par Title (présent sur toutes les lignes du CSV Shopify).
+    """
+    qty_col = COL_QTY
+    if qty_col not in df.columns or df.empty:
+        return df
+
+    def to_int(val):
+        try:
+            return int(float(str(val).replace(",", ".")))
+        except (ValueError, TypeError):
+            return 0
+
+    # Passe 1 : pour chaque titre, y a-t-il au moins une variante avec stock > 0 ?
+    title_has_stock: dict = {}
+    for _, row in df.iterrows():
+        title = str(row.get(COL_TITLE, "")).strip()
+        if not title:
+            continue
+        if title not in title_has_stock:
+            title_has_stock[title] = False
+        if to_int(row.get(qty_col, 0)) > 0:
+            title_has_stock[title] = True
+
+    # Passe 2 : garder uniquement les lignes dont le produit a du stock
+    mask = df[COL_TITLE].apply(
+        lambda t: title_has_stock.get(str(t).strip(), True)
+    )
+    return df[mask].reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# PARTIE 8 — Rapport
 # ══════════════════════════════════════════════════════════════
 
 def generate_report(stats: dict) -> str:
@@ -659,12 +700,20 @@ def run_sync(phys_source, shop_source) -> dict:
         combined_bytes = buf3.getvalue().encode("utf-8")
     else:
         new_products_bytes = b""
-        combined_bytes = shopify_csv_bytes  # Rien de nouveau → fichier Shopify seul
+        combined_df        = shopify_updated
+        combined_bytes     = shopify_csv_bytes  # Rien de nouveau → fichier Shopify seul
+
+    # Fichier filtré : même que combiné, mais sans les produits dont TOUTES les variantes sont à 0
+    filtered_df = filter_zero_stock_products(combined_df)
+    buf4 = io.StringIO()
+    filtered_df.to_csv(buf4, index=False)
+    filtered_bytes = buf4.getvalue().encode("utf-8")
 
     return {
         "shopify_csv":      shopify_csv_bytes,
         "new_products_csv": new_products_bytes,
         "combined_csv":     combined_bytes,
+        "filtered_csv":     filtered_bytes,
         "report":           generate_report(stats),
         "stats":            stats,
     }
